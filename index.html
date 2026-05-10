@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- CNC Species Finder · Version 13 · 2026-05-10 -->
+<!-- CNC Species Finder · Version 14 · 2026-05-10 -->
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -82,6 +82,9 @@ input[type=text]:focus{border-color:#1D9E75;box-shadow:0 0 0 2px rgba(29,158,117
 /* Compass heading arrow */
 .heading-arrow{background:none!important;border:none!important}
 .heading-triangle{font-size:22px;color:#1D9E75;text-shadow:0 0 3px rgba(0,0,0,0.4);text-align:center;line-height:30px;transition:transform 0.3s ease}
+/* Custom map markers */
+.you-marker{background:none!important;border:none!important}
+.plant-marker{background:none!important;border:none!important}
 </style>
 </head>
 <body>
@@ -856,42 +859,67 @@ async function openDetail(taxon_id,name,sci,photoUrl){
   modal.classList.add('open'); document.body.style.overflow='hidden';
   await new Promise(r=>setTimeout(r,300));
   if(detailMapInstance){ detailMapInstance.remove(); detailMapInstance=null; }
-  detailMapInstance=L.map('detail-map-el',{zoomControl:false}).setView([userLat||searchLat,userLng||searchLng],17);
+
+  const myLat=userLat||searchLat;
+  const myLng=userLng||searchLng;
+
+  detailMapInstance=L.map('detail-map-el',{zoomControl:false}).setView([myLat,myLng],17);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:19}).addTo(detailMapInstance);
   setTimeout(()=>{ detailMapInstance.invalidateSize(); },300);
   setTimeout(()=>{ detailMapInstance.invalidateSize(); },800);
   setTimeout(()=>{ detailMapInstance.invalidateSize(); },1500);
 
-  // Your location dot — will be updated by GPS watch
-  detailUserMarker=L.circleMarker([userLat||searchLat,userLng||searchLng],
-    {radius:10,color:'#1D9E75',fillColor:'#1D9E75',fillOpacity:1,weight:2.5})
-    .addTo(detailMapInstance).bindPopup('<b>You</b>');
+  // YOUR location — green dot with "YOU" label
+  const youIcon=L.divIcon({
+    className:'you-marker',
+    html:'<div style="background:#1D9E75;width:18px;height:18px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.4)"></div><div style="color:#1D9E75;font-weight:800;font-size:11px;text-align:center;margin-top:1px;text-shadow:0 0 3px #fff,0 0 3px #fff">YOU</div>',
+    iconSize:[30,40],
+    iconAnchor:[15,9]
+  });
+  detailUserMarker=L.marker([myLat,myLng],{icon:youIcon,zIndexOffset:3000}).addTo(detailMapInstance);
 
-  // Compass heading triangle — shows which direction phone faces
-  detailHeadingMarker=createHeadingMarker([userLat||searchLat,userLng||searchLng],0);
+  // Compass heading triangle
+  detailHeadingMarker=createHeadingMarker([myLat,myLng],0);
   detailHeadingMarker.addTo(detailMapInstance);
 
-  // Start live GPS tracking for detail view
+  // Start live GPS tracking
   startDetailGPS();
 
-  // Start compass listening
+  // Compass — on iOS needs user gesture, so we try silently first
   startCompass();
 
-  // Fetch and show ONLY this species' locations
+  // Fetch species locations — use a wider search centered on user's actual position
   try {
-    const locs=await fetchLocs(taxon_id);
-    locs.forEach(loc=>{
-      L.circleMarker([loc.lat,loc.lng],{radius:10,color:'#a30000',fillColor:'#ff4444',fillOpacity:1,weight:2.5})
-        .addTo(detailMapInstance)
-        .bindPopup(`<b>${cap(name)}</b><br><a href="https://www.inaturalist.org/observations/${loc.id}" target="_blank">View on iNat ↗</a>`);
+    // Search up to 5km from user to find this species regardless of default location
+    const searchRadius=Math.max(RADIUS_STEPS[radiusIdx],5);
+    const r=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${taxon_id}&lat=${myLat}&lng=${myLng}&radius=${searchRadius}&quality_grade=${QUALITY}&lrank=species&hrank=species&per_page=50&fields=id,location`);
+    const d=await r.json();
+    const locs=(d.results||[]).filter(o=>o.location).map(o=>{
+      const [lat,lng]=o.location.split(',').map(Number);
+      return {lat,lng,id:o.id};
     });
+
+    // Species dots — large red with label
+    locs.forEach(loc=>{
+      const dist=Math.round(distMeters(myLat,myLng,loc.lat,loc.lng));
+      const plantIcon=L.divIcon({
+        className:'plant-marker',
+        html:`<div style="background:#ff4444;width:16px;height:16px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.4)"></div><div style="color:#a30000;font-weight:700;font-size:10px;text-align:center;text-shadow:0 0 3px #fff,0 0 3px #fff">${dist}m</div>`,
+        iconSize:[40,35],
+        iconAnchor:[20,8]
+      });
+      L.marker([loc.lat,loc.lng],{icon:plantIcon,zIndexOffset:2000})
+        .addTo(detailMapInstance)
+        .bindPopup(`<b>${cap(name)}</b><br>${dist}m away<br><a href="https://www.inaturalist.org/observations/${loc.id}" target="_blank">View on iNat ↗</a>`);
+    });
+
     const sp=missingSpecies.find(s=>s.taxon_id===taxon_id);
     if(sp&&locs.length&&sp.nearestDist===undefined){
-      sp.nearestDist=distMeters(userLat||searchLat,userLng||searchLng,locs[0].lat,locs[0].lng);
+      sp.nearestDist=distMeters(myLat,myLng,locs[0].lat,locs[0].lng);
       sortByProximity();
     }
     if(locs.length)
-      detailMapInstance.fitBounds([[userLat||searchLat,userLng||searchLng],...locs.map(l=>[l.lat,l.lng])],{padding:[30,30]});
+      detailMapInstance.fitBounds([[myLat,myLng],...locs.map(l=>[l.lat,l.lng])],{padding:[40,40]});
   } catch(e){}
 }
 
@@ -903,12 +931,10 @@ function startDetailGPS(){
     if(detailMapInstance&&detailUserMarker){
       detailUserMarker.setLatLng([userLat,userLng]);
       if(detailHeadingMarker) updateHeadingMarker(detailHeadingMarker,[userLat,userLng],currentHeading||0);
-      // Keep map centered on you as you walk
       detailMapInstance.panTo([userLat,userLng],{animate:true,duration:0.5});
     }
-    // Also update main map's user dot
     updateUserDot();
-  },{enableHighAccuracy:true,maximumAge:3000,timeout:10000});
+  },()=>{/* GPS unavailable */},{enableHighAccuracy:true,maximumAge:3000,timeout:10000});
 }
 
 function stopDetailGPS(){
