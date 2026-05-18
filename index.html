@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- CNC Species Finder · Version 14 · 2026-05-10 -->
+<!-- CNC Species Finder · Version 15 · 2026-05-11 -->
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -161,6 +161,8 @@ let radiusIdx      = 0;
 let walkWatchId    = null;
 let lastRefreshLat = null;
 let lastRefreshLng = null;
+let includeAnimals = false;   // toggle: include nearby animals seen in last week
+let myAllSpecies   = null;     // cache of user's observations across all taxa (for animal mode)
 
 const $ = id => document.getElementById(id);
 const main = () => $('main');
@@ -363,12 +365,29 @@ async function loadData(){
   try {
     const mine=await fetchMySpecies();
     mySpecies=new Set(mine.map(s=>s.taxon_id));
+
+    // If animals included, also load user's animal observations
+    let myAllCount=mine.length;
+    if(includeAnimals){
+      main().innerHTML=loader('Loading your animal observations…');
+      const myAll=await fetchMyAllSpecies();
+      myAll.forEach(s=>mySpecies.add(s.taxon_id));
+      myAllCount=myAll.length;
+    }
+
     main().innerHTML=loader(`Scanning ${RADIUS_LABELS[radiusIdx]} radius…`);
     const nearby=await fetchNearby(RADIUS_STEPS[radiusIdx]);
-    missingSpecies=nearby.filter(s=>!mySpecies.has(s.taxon_id));
+    let allNearby=nearby;
+
+    if(includeAnimals){
+      main().innerHTML=loader('Scanning for nearby animals (last 7 days)…');
+      const animals=await fetchNearbyAnimals(RADIUS_STEPS[radiusIdx]);
+      allNearby=[...nearby,...animals];
+    }
+
+    missingSpecies=allNearby.filter(s=>!mySpecies.has(s.taxon_id));
     sortByProximity();
-    renderResults(mine.length,nearby.length);
-    // Fetch coords in background so list sorts by proximity automatically
+    renderResults(includeAnimals?myAllCount:mine.length, allNearby.length);
     backgroundProximityFetch();
   } catch(e){ showError('API error: '+e.message); reset(); }
 }
@@ -407,7 +426,25 @@ async function fetchMySpecies(){
   let page=1,all=[];
   const dates=myDateParams();
   while(true){
-    const r=await fetch(`https://api.inaturalist.org/v1/observations/species_counts?user_login=${USERNAME}&taxon_id=${TAXON_PLANTS}&quality_grade=${QUALITY}&lrank=species&hrank=species${dates}&per_page=200&page=${page}`);
+    // Use only hrank=species (no lrank) — counts subspecies/variety IDs as found too
+    const r=await fetch(`https://api.inaturalist.org/v1/observations/species_counts?user_login=${USERNAME}&taxon_id=${TAXON_PLANTS}&quality_grade=${QUALITY}&hrank=species${dates}&per_page=200&page=${page}`);
+    const d=await r.json();
+    if(!d.results||!d.results.length) break;
+    d.results.forEach(s=>all.push({taxon_id:s.taxon.id,name:s.taxon.preferred_common_name||s.taxon.name,sci:s.taxon.name}));
+    if(all.length>=d.total_results) break;
+    if(++page>15) break;
+  }
+  // Also fetch animal/other species the user has observed, for animal mode
+  // We do this in a separate function called when animal mode is toggled
+  return all;
+}
+
+// Fetch all the user's observations across ALL taxa (for animals mode)
+async function fetchMyAllSpecies(){
+  let page=1,all=[];
+  const dates=myDateParams();
+  while(true){
+    const r=await fetch(`https://api.inaturalist.org/v1/observations/species_counts?user_login=${USERNAME}&quality_grade=${QUALITY}&hrank=species${dates}&per_page=200&page=${page}`);
     const d=await r.json();
     if(!d.results||!d.results.length) break;
     d.results.forEach(s=>all.push({taxon_id:s.taxon.id,name:s.taxon.preferred_common_name||s.taxon.name,sci:s.taxon.name}));
@@ -419,7 +456,7 @@ async function fetchMySpecies(){
 
 async function fetchNearby(rkm){
   const d1=isoDate(180),d2=isoDate(0);
-  const r=await fetch(`https://api.inaturalist.org/v1/observations/species_counts?taxon_id=${TAXON_PLANTS}&lat=${searchLat}&lng=${searchLng}&radius=${rkm}&quality_grade=${QUALITY}&lrank=species&hrank=species&d1=${d1}&d2=${d2}&per_page=200`);
+  const r=await fetch(`https://api.inaturalist.org/v1/observations/species_counts?taxon_id=${TAXON_PLANTS}&lat=${searchLat}&lng=${searchLng}&radius=${rkm}&quality_grade=${QUALITY}&hrank=species&d1=${d1}&d2=${d2}&per_page=200`);
   const d=await r.json();
   const results=(d.results||[]).map(s=>({
     taxon_id:s.taxon.id,
@@ -430,6 +467,7 @@ async function fetchNearby(rkm){
     photoLarge:s.taxon.default_photo?.medium_url||s.taxon.default_photo?.square_url||null,
     iconic:s.taxon.iconic_taxon_name||'',
     isTree:isLikelyTree(s.taxon.name,s.taxon.preferred_common_name||''),
+    isAnimal:false,
     nearestDist:undefined
   }));
 
@@ -438,6 +476,31 @@ async function fetchNearby(rkm){
   if(missingPhotos.length>0){
     await enrichWithPhotos(missingPhotos);
   }
+  return results;
+}
+
+// Fetch nearby ANIMAL observations from the last 7 days
+async function fetchNearbyAnimals(rkm){
+  // Animal iconic taxa: Aves (birds=3), Mammalia (40151), Reptilia (26036), Amphibia (20978),
+  // Actinopterygii (47178), Insecta (47158), Arachnida (47119), Mollusca (47115)
+  // We use without_taxon_id=Plantae,Fungi to exclude those, OR use iconic_taxa filter
+  const d1=isoDate(7),d2=isoDate(0);
+  const r=await fetch(`https://api.inaturalist.org/v1/observations/species_counts?iconic_taxa=Aves,Mammalia,Reptilia,Amphibia,Actinopterygii,Insecta,Arachnida,Mollusca&lat=${searchLat}&lng=${searchLng}&radius=${rkm}&quality_grade=${QUALITY}&hrank=species&d1=${d1}&d2=${d2}&per_page=200`);
+  const d=await r.json();
+  const results=(d.results||[]).map(s=>({
+    taxon_id:s.taxon.id,
+    name:s.taxon.preferred_common_name||s.taxon.name,
+    sci:s.taxon.name,
+    count:s.count,
+    photo:s.taxon.default_photo?.square_url||null,
+    photoLarge:s.taxon.default_photo?.medium_url||s.taxon.default_photo?.square_url||null,
+    iconic:s.taxon.iconic_taxon_name||'',
+    isTree:false,
+    isAnimal:true,
+    nearestDist:undefined
+  }));
+  const missingPhotos=results.filter(s=>!s.photo);
+  if(missingPhotos.length>0) await enrichWithPhotos(missingPhotos);
   return results;
 }
 
@@ -551,6 +614,10 @@ function renderResults(myCount,nearbyCount){
         <button class="btn-secondary" onclick="rescan()">📍 My GPS</button>
         <button class="btn-secondary" id="walk-btn" onclick="toggleWalk()">${walkWatchId!==null?'⏹ Stop walking':'🚶 Walk mode'}</button>
       </div>
+      <div style="margin-top:10px;padding:8px 10px;background:#f5f5f0;border-radius:8px;display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="animals-toggle" ${includeAnimals?'checked':''} onchange="toggleAnimals()" style="cursor:pointer;width:18px;height:18px;accent-color:#1D9E75"/>
+        <label for="animals-toggle" style="font-size:13px;cursor:pointer;flex:1">🐦 Include animals seen here in last 7 days</label>
+      </div>
     </div>
     <div class="card" style="padding-bottom:4px">
       <div class="tabs">
@@ -573,6 +640,11 @@ function updateStats(myCount){
   const ms=$('stat-miss');if(ms)ms.textContent=missing;
   const pb=$('pbar');if(pb)pb.style.width=pct+'%';
   const pl=$('pct-label');if(pl)pl.textContent=`${pct}% found · ${RADIUS_LABELS[radiusIdx]} radius`;
+}
+
+async function toggleAnimals(){
+  includeAnimals=!includeAnimals;
+  await loadData();
 }
 
 async function toggleAllTime(){
@@ -603,10 +675,14 @@ function renderList(el){
   if(activeFilter==='fungi')       filtered=filtered.filter(s=>(s.iconic||'').toLowerCase()==='fungi');
   else if(activeFilter==='cactus') filtered=filtered.filter(s=>isCactusYucca(s.sci));
   else if(activeFilter==='tree')   filtered=filtered.filter(s=>s.isTree||isLikelyTree(s.sci,s.name));
+  else if(activeFilter==='animals') filtered=filtered.filter(s=>s.isAnimal);
+  else if(activeFilter==='plants')  filtered=filtered.filter(s=>!s.isAnimal);
   const sortedByProx=missingSpecies.length>0&&missingSpecies[0].nearestDist!==undefined;
   el.innerHTML=`
     <div class="filters">
       <button class="filter-btn ${activeFilter==='all'?'active':''}"    onclick="setFilter('all')">All</button>
+      ${includeAnimals?`<button class="filter-btn ${activeFilter==='plants'?'active':''}" onclick="setFilter('plants')">Plants only</button>
+      <button class="filter-btn ${activeFilter==='animals'?'active':''}" onclick="setFilter('animals')">🐦 Animals</button>`:''}
       <button class="filter-btn ${activeFilter==='tree'?'active':''}"   onclick="setFilter('tree')">Trees</button>
       <button class="filter-btn ${activeFilter==='cactus'?'active':''}" onclick="setFilter('cactus')">Cacti &amp; Yucca</button>
       <button class="filter-btn ${activeFilter==='fungi'?'active':''}"  onclick="setFilter('fungi')">Fungi</button>
@@ -685,24 +761,15 @@ function initMap(){
   // Auto-fetch real locations for top 15 missing species in background
   autoLoadSpeciesOnMap();
 
-  // Tap anywhere to search new location
+  // Tap anywhere to search new location — full rescan including animals if enabled
   mapInstance.on('click',async e=>{
-    // Ignore clicks on markers
     if(e.originalEvent._stopped) return;
     const {lat,lng}=e.latlng;
     if(searchPinLayer) mapInstance.removeLayer(searchPinLayer);
     searchPinLayer=L.marker([lat,lng]).addTo(mapInstance).bindPopup('Searching here…').openPopup();
     searchLat=lat; searchLng=lng;
-    main().innerHTML=loader(`Scanning ${RADIUS_LABELS[radiusIdx]} radius…`);
-    try {
-      const mine=await fetchMySpecies();
-      mySpecies=new Set(mine.map(s=>s.taxon_id));
-      const nearby=await fetchNearby(RADIUS_STEPS[radiusIdx]);
-      missingSpecies=nearby.filter(s=>!mySpecies.has(s.taxon_id));
-      sortByProximity();
-      renderResults(mine.length,nearby.length);
-      switchTab('map');
-    } catch(e2){ showError('API error: '+e2.message); }
+    await loadData();
+    switchTab('map');
   });
 }
 
@@ -888,38 +955,40 @@ async function openDetail(taxon_id,name,sci,photoUrl){
   // Compass — on iOS needs user gesture, so we try silently first
   startCompass();
 
-  // Fetch species locations — use a wider search centered on user's actual position
+  // Fetch species locations — wider search to find them
   try {
-    // Search up to 5km from user to find this species regardless of default location
     const searchRadius=Math.max(RADIUS_STEPS[radiusIdx],5);
-    const r=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${taxon_id}&lat=${myLat}&lng=${myLng}&radius=${searchRadius}&quality_grade=${QUALITY}&lrank=species&hrank=species&per_page=50&fields=id,location`);
+    const r=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${taxon_id}&lat=${myLat}&lng=${myLng}&radius=${searchRadius}&quality_grade=${QUALITY}&hrank=species&per_page=50&fields=id,location`);
     const d=await r.json();
-    const locs=(d.results||[]).filter(o=>o.location).map(o=>{
+    const allLocs=(d.results||[]).filter(o=>o.location).map(o=>{
       const [lat,lng]=o.location.split(',').map(Number);
-      return {lat,lng,id:o.id};
-    });
+      return {lat,lng,id:o.id,dist:distMeters(myLat,myLng,lat,lng)};
+    }).sort((a,b)=>a.dist-b.dist);
 
-    // Species dots — large red with label
-    locs.forEach(loc=>{
-      const dist=Math.round(distMeters(myLat,myLng,loc.lat,loc.lng));
+    // ONLY show the closest observation
+    const closest=allLocs[0];
+    if(closest){
+      const dist=Math.round(closest.dist);
       const plantIcon=L.divIcon({
         className:'plant-marker',
-        html:`<div style="background:#ff4444;width:16px;height:16px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.4)"></div><div style="color:#a30000;font-weight:700;font-size:10px;text-align:center;text-shadow:0 0 3px #fff,0 0 3px #fff">${dist}m</div>`,
-        iconSize:[40,35],
-        iconAnchor:[20,8]
+        html:`<div style="background:#ff4444;width:18px;height:18px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.5)"></div><div style="color:#a30000;font-weight:700;font-size:11px;text-align:center;text-shadow:0 0 3px #fff,0 0 3px #fff;margin-top:2px">${dist}m</div>`,
+        iconSize:[50,40],
+        iconAnchor:[25,9]
       });
-      L.marker([loc.lat,loc.lng],{icon:plantIcon,zIndexOffset:2000})
+      L.marker([closest.lat,closest.lng],{icon:plantIcon,zIndexOffset:2000})
         .addTo(detailMapInstance)
-        .bindPopup(`<b>${cap(name)}</b><br>${dist}m away<br><a href="https://www.inaturalist.org/observations/${loc.id}" target="_blank">View on iNat ↗</a>`);
-    });
+        .bindPopup(`<b>${cap(name)}</b><br>${dist}m away<br><a href="https://www.inaturalist.org/observations/${closest.id}" target="_blank">View on iNat ↗</a>`);
 
-    const sp=missingSpecies.find(s=>s.taxon_id===taxon_id);
-    if(sp&&locs.length&&sp.nearestDist===undefined){
-      sp.nearestDist=distMeters(myLat,myLng,locs[0].lat,locs[0].lng);
-      sortByProximity();
+      // Update sort distance
+      const sp=missingSpecies.find(s=>s.taxon_id===taxon_id);
+      if(sp&&sp.nearestDist===undefined){
+        sp.nearestDist=closest.dist;
+        sortByProximity();
+      }
+
+      // Zoom to show YOU + closest with padding
+      detailMapInstance.fitBounds([[myLat,myLng],[closest.lat,closest.lng]],{padding:[50,50],maxZoom:18});
     }
-    if(locs.length)
-      detailMapInstance.fitBounds([[myLat,myLng],...locs.map(l=>[l.lat,l.lng])],{padding:[40,40]});
   } catch(e){}
 }
 
