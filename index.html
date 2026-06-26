@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- CNC Species Finder · Version 15 · 2026-05-11 -->
+<!-- CNC Species Finder · Version 17 · 2026-06-26 -->
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -152,7 +152,10 @@ let missingSpecies = [];
 let mapInstance, detailMapInstance, userDotLayer, searchPinLayer;
 let activeTab      = 'list';
 let activeFilter   = 'all';
-let allTimeMode    = false;
+// Date mode: 'cnc' (default), 'all', 'custom'
+let dateMode       = 'cnc';
+let customStart    = null;
+let customEnd      = null;
 let cncActive      = false;
 let cncStart       = null;
 let cncEnd         = null;
@@ -172,6 +175,26 @@ function loadSavedUsername(){
   try { const u=localStorage.getItem('cnc_username'); if(u){ $('username-input').value=u; } } catch(e){}
 }
 function saveUsername(u){ try { localStorage.setItem('cnc_username',u); } catch(e){} }
+function loadDatePrefs(){
+  try {
+    const m=localStorage.getItem('cnc_dateMode');     if(m) dateMode=m;
+    const s=localStorage.getItem('cnc_customStart');  if(s) customStart=s;
+    const e=localStorage.getItem('cnc_customEnd');    if(e) customEnd=e;
+  } catch(e){}
+}
+function saveDatePrefs(){
+  try {
+    localStorage.setItem('cnc_dateMode',dateMode);
+    if(customStart) localStorage.setItem('cnc_customStart',customStart);
+    if(customEnd)   localStorage.setItem('cnc_customEnd',customEnd);
+  } catch(e){}
+}
+// Display format: M/D/YY (e.g. 4/25/26)
+function fmtDate(iso){
+  if(!iso) return '';
+  const [y,m,d]=iso.split('-').map(Number);
+  return `${m}/${d}/${String(y).slice(2)}`;
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function isoDate(daysAgo){
@@ -233,8 +256,15 @@ async function detectCNC(){
 }
 
 function myDateParams(){
-  if(!allTimeMode&&cncStart&&cncEnd) return `&d1=${cncStart}&d2=${cncEnd}`;
+  if(dateMode==='all') return '';
+  if(dateMode==='custom' && customStart && customEnd) return `&d1=${customStart}&d2=${customEnd}`;
+  if(cncStart && cncEnd) return `&d1=${cncStart}&d2=${cncEnd}`;
   return '';
+}
+function activeRange(){
+  if(dateMode==='all') return {start:null, end:null, label:'all-time'};
+  if(dateMode==='custom' && customStart && customEnd) return {start:customStart, end:customEnd, label:'custom'};
+  return {start:cncStart, end:cncEnd, label:'CNC'};
 }
 
 // ── Start / test ──────────────────────────────────────────────────────────────
@@ -272,20 +302,15 @@ function tryGPSInBackground(){
   if(!navigator.geolocation) return;
   navigator.geolocation.getCurrentPosition(pos=>{
     userLat=pos.coords.latitude; userLng=pos.coords.longitude;
-    // Only auto-update search location if user hasn't already tapped the map
     if(searchLat===DEFAULT_LAT && searchLng===DEFAULT_LNG){
       searchLat=userLat; searchLng=userLng;
       lastRefreshLat=userLat; lastRefreshLng=userLng;
-      // Silently reload with real GPS location
       silentRefresh();
-      // Update user dot on map if open
       updateUserDot();
     } else {
-      // Just update the user dot without changing search area
       updateUserDot();
     }
-    // Start walking mode now that we have GPS
-    startWalking();
+    // (walk mode removed — Map & Route tab handles live GPS now)
   },()=>{ /* GPS unavailable — that's fine, user taps map */ },
   {enableHighAccuracy:true,timeout:15000,maximumAge:0});
 }
@@ -308,9 +333,11 @@ function showStartScreen(){
 function updateTopBarCNC(){
   const el=$('tb-cnc');
   if(!el) return;
-  if(cncActive) el.textContent=`🟢 CNC active: ${cncStart}–${cncEnd}`;
-  else if(cncStart) el.textContent=`🕐 Last CNC: ${cncStart}–${cncEnd}${allTimeMode?' · all-time':''}`;
-  else el.textContent='All-time mode';
+  const r=activeRange();
+  if(dateMode==='all') el.textContent='∞ All-time observations';
+  else if(dateMode==='custom') el.textContent=`🗓 Custom: ${fmtDate(r.start)} – ${fmtDate(r.end)}`;
+  else if(cncActive) el.textContent=`🟢 CNC active: ${fmtDate(cncStart)} – ${fmtDate(cncEnd)}`;
+  else el.textContent=`🕐 CNC: ${fmtDate(cncStart)} – ${fmtDate(cncEnd)}`;
 }
 
 // ── Walking mode ──────────────────────────────────────────────────────────────
@@ -393,14 +420,23 @@ async function loadData(){
 }
 
 async function backgroundProximityFetch(){
-  const top=missingSpecies.slice(0,20);
+  const top=missingSpecies.slice(0,30);
   for(const s of top){
-    if(s.nearestDist!==undefined) continue; // already have it
+    if(s.nearestDist!==undefined) continue;
     try {
       const locs=await fetchLocs(s.taxon_id);
       if(locs.length){
-        s.nearestDist=distMeters(userLat||searchLat,userLng||searchLng,locs[0].lat,locs[0].lng);
-        // Cache for map use later
+        const myLat=userLat||searchLat, myLng=userLng||searchLng;
+        let closest=locs[0], closestDist=distMeters(myLat,myLng,locs[0].lat,locs[0].lng);
+        for(const loc of locs){
+          const dd=distMeters(myLat,myLng,loc.lat,loc.lng);
+          if(dd<closestDist){ closestDist=dd; closest=loc; }
+        }
+        s.nearestDist=closestDist;
+        s.closestObsId=closest.id;
+        // locs are date-desc so locs[0] is most recent
+        const dated=locs.filter(l=>l.observed_on);
+        if(dated.length) s.lastObsDate=dated[0].observed_on;
         if(!speciesLocCache) speciesLocCache={};
         speciesLocCache[s.taxon_id]=locs;
       }
@@ -468,7 +504,9 @@ async function fetchNearby(rkm){
     iconic:s.taxon.iconic_taxon_name||'',
     isTree:isLikelyTree(s.taxon.name,s.taxon.preferred_common_name||''),
     isAnimal:false,
-    nearestDist:undefined
+    nearestDist:undefined,
+    lastObsDate:undefined,
+    closestObsId:undefined
   }));
 
   // If photos are missing (common when date filters are applied), batch-fetch taxon details
@@ -497,7 +535,9 @@ async function fetchNearbyAnimals(rkm){
     iconic:s.taxon.iconic_taxon_name||'',
     isTree:false,
     isAnimal:true,
-    nearestDist:undefined
+    nearestDist:undefined,
+    lastObsDate:undefined,
+    closestObsId:undefined
   }));
   const missingPhotos=results.filter(s=>!s.photo);
   if(missingPhotos.length>0) await enrichWithPhotos(missingPhotos);
@@ -532,11 +572,11 @@ async function enrichWithPhotos(species){
 
 async function fetchLocs(taxon_id){
   const rkm=RADIUS_STEPS[radiusIdx];
-  const r=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${taxon_id}&lat=${searchLat}&lng=${searchLng}&radius=${rkm}&quality_grade=${QUALITY}&lrank=species&hrank=species&per_page=50&fields=id,location`);
+  const r=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${taxon_id}&lat=${searchLat}&lng=${searchLng}&radius=${rkm}&quality_grade=${QUALITY}&hrank=species&per_page=50&fields=id,location,observed_on&order=desc&order_by=observed_on`);
   const d=await r.json();
   return (d.results||[]).filter(o=>o.location).map(o=>{
     const [lat,lng]=o.location.split(',').map(Number);
-    return {lat,lng,id:o.id};
+    return {lat,lng,id:o.id,observed_on:o.observed_on};
   });
 }
 
@@ -556,23 +596,49 @@ function isLikelyTree(sci,common){
 // ── Rendering ─────────────────────────────────────────────────────────────────
 function cncBanner(){
   const pinMode=(searchLat!==userLat||searchLng!==userLng);
-  const statusLabel=cncActive?'🟢 Active CNC':'🕐 Most recent CNC';
-  const bgColor=cncActive?'#e6f4ee':'#f5f0e6';
-  const textColor=cncActive?'#0f6e56':'#6b4f0b';
-  const toggleLabel=allTimeMode?'CNC dates':'All-time';
+  const r=activeRange();
+  const bgColor = dateMode==='cnc' ? (cncActive?'#e6f4ee':'#f5f0e6') :
+                  dateMode==='custom' ? '#eef1f8' : '#f5f5f0';
+  const textColor = dateMode==='cnc' ? (cncActive?'#0f6e56':'#6b4f0b') :
+                    dateMode==='custom' ? '#1f3d7a' : '#3d3d3a';
+  const headerLabel = dateMode==='cnc' ? (cncActive?'🟢 Active CNC: '+cncName : '🕐 '+cncName) :
+                      dateMode==='custom' ? '🗓 Custom date range' : '∞ All-time observations';
+  const btn = (mode,label) => `<button onclick="setDateMode('${mode}')" style="background:${dateMode===mode?'#1D9E75':'#fff'};color:${dateMode===mode?'#fff':'#3d3d3a'};border:1px solid ${dateMode===mode?'#1D9E75':'#ccc'};border-radius:6px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap">${label}</button>`;
   return `
     <div style="background:${bgColor};border-radius:8px;padding:8px 12px;margin-bottom:10px">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
-        <div>
-          <div style="font-size:12px;color:${textColor};font-weight:600">${statusLabel}: ${cncName}</div>
-          <div style="font-size:11px;color:#6b6b65;margin-top:1px">${cncStart} – ${cncEnd}</div>
-        </div>
-        <button onclick="toggleAllTime()" style="background:#fff;border:1px solid #ccc;border-radius:6px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;color:${allTimeMode?'#854f0b':'#0f6e56'}">
-          ${allTimeMode?'▶ '+toggleLabel:'▶ '+toggleLabel}
-        </button>
+      <div style="font-size:12px;color:${textColor};font-weight:600;margin-bottom:6px">${headerLabel}${r.start?' · '+fmtDate(r.start)+' – '+fmtDate(r.end):''}</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        ${btn('all','∞ All')}
+        ${btn('cnc','CNC')}
+        ${btn('custom','🗓 Custom')}
+        ${dateMode==='custom'?`
+          <input type="date" id="custom-start-input" value="${customStart||''}" onchange="updateCustomDates()" style="font-size:11px;padding:2px 4px;border:1px solid #ccc;border-radius:4px"/>
+          <span style="font-size:11px">–</span>
+          <input type="date" id="custom-end-input" value="${customEnd||''}" onchange="updateCustomDates()" style="font-size:11px;padding:2px 4px;border:1px solid #ccc;border-radius:4px"/>
+        `:''}
       </div>
       ${pinMode?`<div style="margin-top:6px;font-size:11px;color:#854f0b">📌 Searching dropped pin · <button onclick="resetToGPS()" style="background:none;border:none;color:#185FA5;font-size:11px;cursor:pointer;text-decoration:underline;padding:0">Return to GPS</button></div>`:''}
     </div>`;
+}
+
+async function setDateMode(mode){
+  dateMode=mode;
+  if(mode==='custom' && (!customStart||!customEnd)){
+    customStart = cncStart || CNC_FALLBACK_START;
+    customEnd   = cncEnd   || CNC_FALLBACK_END;
+  }
+  saveDatePrefs();
+  await loadData();
+}
+async function updateCustomDates(){
+  const s=$('custom-start-input'); const e=$('custom-end-input');
+  if(s&&e&&s.value&&e.value){
+    customStart=s.value;
+    customEnd=e.value;
+    dateMode='custom';
+    saveDatePrefs();
+    await loadData();
+  }
 }
 
 function radiusBar(){
@@ -598,7 +664,7 @@ function updateRadius(val){
 function renderResults(myCount,nearbyCount){
   const missing=missingSpecies.length;
   const pct=nearbyCount>0?Math.round(myCount/(myCount+missing)*100):0;
-  const modeLabel=allTimeMode?'all-time':'CNC dates';
+  const modeLabel = dateMode==='all'?'all-time' : dateMode==='custom'?'custom range' : 'CNC dates';
   main().innerHTML=`
     <div class="card">
       ${cncBanner()}
@@ -610,10 +676,6 @@ function renderResults(myCount,nearbyCount){
       </div>
       <div class="progress"><div class="progress-fill" id="pbar" style="width:0%"></div></div>
       <div class="progress-label" id="pct-label">${pct}% found · ${RADIUS_LABELS[radiusIdx]} radius</div>
-      <div class="rescan-row">
-        <button class="btn-secondary" onclick="rescan()">📍 My GPS</button>
-        <button class="btn-secondary" id="walk-btn" onclick="toggleWalk()">${walkWatchId!==null?'⏹ Stop walking':'🚶 Walk mode'}</button>
-      </div>
       <div style="margin-top:10px;padding:8px 10px;background:#f5f5f0;border-radius:8px;display:flex;align-items:center;gap:8px">
         <input type="checkbox" id="animals-toggle" ${includeAnimals?'checked':''} onchange="toggleAnimals()" style="cursor:pointer;width:18px;height:18px;accent-color:#1D9E75"/>
         <label for="animals-toggle" style="font-size:13px;cursor:pointer;flex:1">🐦 Include animals seen here in last 7 days</label>
@@ -648,8 +710,7 @@ async function toggleAnimals(){
 }
 
 async function toggleAllTime(){
-  allTimeMode=!allTimeMode;
-  updateTopBarCNC();
+  // Legacy stub — kept to avoid breakage if called
   await loadData();
 }
 async function applyRadius(){ lastRefreshLat=searchLat; lastRefreshLng=searchLng; await loadData(); }
@@ -660,6 +721,7 @@ async function resetToGPS(){
 }
 
 function switchTab(t){
+  if(activeTab==='map' && t!=='map' && typeof leaveRouteTab==='function') leaveRouteTab();
   activeTab=t;
   ['list','map'].forEach(n=>{ const el=$('tab-'+n); if(el) el.classList.toggle('active',n===t); });
   renderTab();
@@ -697,7 +759,7 @@ function renderList(el){
         <div class="species-info">
           <div class="species-name">${cap(s.name)}</div>
           <div class="species-sci">${s.sci}</div>
-          <div class="species-meta">${s.nearestDist!==undefined?'~'+Math.round(s.nearestDist)+'m · ':''}📍 ${s.count} obs</div>
+          <div class="species-meta">${s.nearestDist!==undefined?'~'+Math.round(s.nearestDist)+'m · ':''}📍 ${s.count} obs${s.lastObsDate?' · last '+fmtDate(s.lastObsDate):''}</div>
         </div>
         <button class="map-btn" onclick="pinSpecies(${s.taxon_id},'${esc(s.name)}','${esc(s.sci)}')">Map</button>
       </div>`).join('')}
@@ -707,201 +769,239 @@ function renderList(el){
 }
 
 // ── Map tab ───────────────────────────────────────────────────────────────────
+// ────────── MAP & ROUTE (1-mile scan, 2 species view) ──────────
+const MAP_ROUTE_RADIUS_KM = 1.609;  // 1 mile
+
+let routeSpecies = [];         // species with cached closest coord + last date
+let routeSlot1 = null;         // closest
+let routeSlot2 = null;         // closest one user is approaching
+let prevDistances = {};        // taxon_id → distance at previous GPS update
+let routeWatchId = null;
+let routeMapInstance = null;
+let routeUserMarker = null;
+let routeHeadingMarker = null;
+let routeSlot1Marker = null;
+let routeSlot2Marker = null;
+
+// Cache used by detail-view pinSpecies fallback
+let speciesLocCache = {};
+
 function renderMapTab(el){
   el.innerHTML=`
-    <div id="map-load-hint" class="map-hint">⏳ Loading species locations…</div>
-    <div id="map" style="height:300px;width:100%;border-radius:10px;overflow:hidden;border:1px solid #e0ded6;margin-bottom:12px;background:#e8e8e2;display:block"></div>
-    <div style="display:flex;gap:8px;margin-bottom:12px">
-      <button class="btn-primary" onclick="buildRoute()" style="flex:1">🗺 Build route</button>
-      <button class="btn-secondary" onclick="resetHighlight()" title="Show all species">Reset</button>
+    <div id="route-hint" class="map-hint">⏳ Scanning 1 mile radius…</div>
+    <div id="route-map" style="height:320px;width:100%;border-radius:10px;overflow:hidden;border:1px solid #e0ded6;margin-bottom:10px;background:#e8e8e2;display:block"></div>
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <button class="btn-primary" onclick="rescanRouteFromHere()" style="flex:1">🔍 Rescan from here</button>
     </div>
-    <div id="route-out"></div>
-    <div style="height:8px"></div>
+    <div id="route-cards"></div>
+    <div style="height:12px"></div>
   `;
-  // Use multiple fallback timings to handle iframe/htmlpreview wrapper delays
-  setTimeout(initMap, 300);
-  setTimeout(()=>{ if(mapInstance) mapInstance.invalidateSize(); else initMap(); }, 800);
-  setTimeout(()=>{ if(mapInstance) mapInstance.invalidateSize(); }, 1500);
-  setTimeout(()=>{ if(mapInstance) mapInstance.invalidateSize(); }, 3000);
+  setTimeout(initRouteMap, 200);
 }
 
-// Cache of taxon_id → array of {lat,lng,id} fetched for the map
-let speciesLocCache = {};
-// Leaflet layer groups: one for all species dots, one for highlighted species
-let speciesLayerGroup = null;
-let highlightLayerGroup = null;
-let selectedTaxonId = null;
+async function initRouteMap(){
+  const mapEl=$('route-map'); if(!mapEl) return;
+  if(routeMapInstance){ routeMapInstance.remove(); routeMapInstance=null; }
 
-function initMap(){
-  const mapEl=$('map'); if(!mapEl) return;
-  if(mapInstance){ mapInstance.remove(); mapInstance=null; }
-  speciesLocCache={};
-  selectedTaxonId=null;
-  mapInstance=L.map('map',{zoomControl:true}).setView([searchLat,searchLng],17);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:19}).addTo(mapInstance);
-  // Call invalidateSize multiple times to handle iframe/wrapper rendering delays
-  setTimeout(()=>{ mapInstance.invalidateSize(); },200);
-  setTimeout(()=>{ mapInstance.invalidateSize(); },600);
-  setTimeout(()=>{ mapInstance.invalidateSize(); },1200);
+  const myLat=userLat||searchLat, myLng=userLng||searchLng;
+  routeMapInstance=L.map('route-map',{zoomControl:true}).setView([myLat,myLng],15);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:19}).addTo(routeMapInstance);
+  setTimeout(()=>{ routeMapInstance.invalidateSize(); },200);
+  setTimeout(()=>{ routeMapInstance.invalidateSize(); },600);
+  setTimeout(()=>{ routeMapInstance.invalidateSize(); },1500);
 
-  const radiusM=RADIUS_STEPS[radiusIdx]*1000;
-  userDotLayer=L.circleMarker([userLat||searchLat,userLng||searchLng],
-    {radius:9,color:'#1D9E75',fillColor:'#1D9E75',fillOpacity:1,weight:2.5,zIndexOffset:1000})
-    .addTo(mapInstance).bindPopup('<b>You are here</b>');
-  L.circle([searchLat,searchLng],{radius:radiusM,color:'#1D9E75',fillOpacity:0.04,weight:1,dashArray:'5'}).addTo(mapInstance);
-  if(searchPinLayer) searchPinLayer.addTo(mapInstance);
-
-  speciesLayerGroup=L.layerGroup().addTo(mapInstance);
-  highlightLayerGroup=L.layerGroup().addTo(mapInstance);
-
-  // Show loading hint on map
-  const hint=$('map-load-hint');
-  if(hint) hint.textContent='⏳ Loading species locations…';
-
-  // Auto-fetch real locations for top 15 missing species in background
-  autoLoadSpeciesOnMap();
-
-  // Tap anywhere to search new location — full rescan including animals if enabled
-  mapInstance.on('click',async e=>{
-    if(e.originalEvent._stopped) return;
-    const {lat,lng}=e.latlng;
-    if(searchPinLayer) mapInstance.removeLayer(searchPinLayer);
-    searchPinLayer=L.marker([lat,lng]).addTo(mapInstance).bindPopup('Searching here…').openPopup();
-    searchLat=lat; searchLng=lng;
-    await loadData();
-    switchTab('map');
+  const youIcon=L.divIcon({
+    className:'you-marker',
+    html:'<div style="background:#1D9E75;width:20px;height:20px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.4)"></div><div style="color:#1D9E75;font-weight:800;font-size:11px;text-align:center;margin-top:1px;text-shadow:0 0 3px #fff,0 0 3px #fff">YOU</div>',
+    iconSize:[34,42], iconAnchor:[17,10]
   });
+  routeUserMarker=L.marker([myLat,myLng],{icon:youIcon,zIndexOffset:3000}).addTo(routeMapInstance);
+  L.circle([myLat,myLng],{radius:MAP_ROUTE_RADIUS_KM*1000,color:'#1D9E75',fillOpacity:0.03,weight:1,dashArray:'6'}).addTo(routeMapInstance);
+
+  routeHeadingMarker=createHeadingMarker([myLat,myLng],0);
+  routeHeadingMarker.addTo(routeMapInstance);
+
+  startRouteGPS();
+  startCompass();
+
+  await scanRouteArea(myLat,myLng);
 }
 
-async function autoLoadSpeciesOnMap(){
-  const top=missingSpecies.slice(0,15);
-  let loadedCount=0;
-  for(const s of top){
-    if(!mapInstance) return; // map was closed
-    try {
-      const locs=await fetchLocs(s.taxon_id);
-      speciesLocCache[s.taxon_id]=locs;
-      if(locs.length){
-        s.nearestDist=distMeters(userLat||searchLat,userLng||searchLng,locs[0].lat,locs[0].lng);
-        // Add dot to species layer group (orange = unselected)
-        locs.forEach(loc=>{
-          const marker=L.circleMarker([loc.lat,loc.lng],{
-            radius:7,color:'#854f0b',fillColor:'#EF9F27',fillOpacity:0.85,weight:1.5
-          }).bindPopup(`<b>${cap(s.name)}</b><br><em>${s.sci}</em><br><a href="https://www.inaturalist.org/observations/${loc.id}" target="_blank">View on iNat ↗</a>`);
-          marker._taxonId=s.taxon_id;
-          marker.on('click',()=>{ highlightSpecies(s.taxon_id,s.name,s.sci); e&&(e._stopped=true); });
-          speciesLayerGroup.addLayer(marker);
-        });
-        loadedCount++;
-      }
-    } catch(e){}
-    // Small delay between fetches to avoid hammering the API
-    await new Promise(r=>setTimeout(r,120));
-  }
-  sortByProximity();
-  // Update hint
-  const hint=$('map-load-hint');
-  if(hint) hint.textContent=`📍 ${loadedCount} species plotted · tap a dot to highlight · tap map to search new area`;
-  // Refresh list to show proximity sorting
-  if(activeTab==='list'){ const el=$('tab-content'); if(el) renderList(el); }
-}
+async function scanRouteArea(centerLat, centerLng){
+  const hint=$('route-hint');
+  if(hint) hint.textContent='⏳ Scanning 1 mile radius…';
 
-function highlightSpecies(taxon_id,name,sci){
-  // Clear previous highlight
-  highlightLayerGroup.clearLayers();
-  selectedTaxonId=taxon_id;
+  try {
+    const dates=myDateParams();
+    const taxonFilter = includeAnimals ? '' : `&taxon_id=${TAXON_PLANTS}`;
+    const r=await fetch(`https://api.inaturalist.org/v1/observations/species_counts?lat=${centerLat}&lng=${centerLng}&radius=${MAP_ROUTE_RADIUS_KM}&quality_grade=${QUALITY}&hrank=species${taxonFilter}${dates}&per_page=200`);
+    const d=await r.json();
+    let candidates=(d.results||[]).map(s=>({
+      taxon_id:s.taxon.id,
+      name:s.taxon.preferred_common_name||s.taxon.name,
+      sci:s.taxon.name,
+      count:s.count,
+      photo:s.taxon.default_photo?.square_url||null,
+      photoLarge:s.taxon.default_photo?.medium_url||s.taxon.default_photo?.square_url||null,
+      iconic:s.taxon.iconic_taxon_name||'',
+      lastObsDate:undefined,
+      closestLat:undefined,
+      closestLng:undefined,
+      closestObsId:undefined
+    })).filter(s=>!mySpecies.has(s.taxon_id));
 
-  // Re-style all species dots: dim non-selected, brighten selected
-  speciesLayerGroup.eachLayer(marker=>{
-    if(marker._taxonId===taxon_id){
-      // Highlighted: red/pink, larger
-      marker.setStyle({radius:11,color:'#a30000',fillColor:'#ff4444',fillOpacity:1,weight:2.5});
-      marker.bringToFront();
-    } else {
-      // Dimmed: grey
-      marker.setStyle({radius:6,color:'#888',fillColor:'#bbb',fillOpacity:0.5,weight:1});
+    const noPhoto=candidates.filter(s=>!s.photo);
+    if(noPhoto.length) await enrichWithPhotos(noPhoto);
+
+    candidates.sort((a,b)=>b.count-a.count);
+    const topN=candidates.slice(0,25);
+    for(const s of topN){
+      try {
+        const r2=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${s.taxon_id}&lat=${centerLat}&lng=${centerLng}&radius=${MAP_ROUTE_RADIUS_KM}&quality_grade=${QUALITY}&hrank=species&per_page=30&fields=id,location,observed_on&order=desc&order_by=observed_on`);
+        const d2j=await r2.json();
+        const locs=(d2j.results||[]).filter(o=>o.location).map(o=>{
+          const [lat,lng]=o.location.split(',').map(Number);
+          return {lat,lng,id:o.id,observed_on:o.observed_on,
+                  dist:distMeters(centerLat,centerLng,lat,lng)};
+        }).sort((a,b)=>a.dist-b.dist);
+        if(locs.length){
+          s.closestLat=locs[0].lat;
+          s.closestLng=locs[0].lng;
+          s.closestObsId=locs[0].id;
+          const dated=(d2j.results||[]).filter(o=>o.observed_on);
+          if(dated.length) s.lastObsDate=dated[0].observed_on;
+        }
+      } catch(e){}
+      await new Promise(r=>setTimeout(r,80));
     }
-  });
 
-  // Zoom to first location of selected species
-  const locs=speciesLocCache[taxon_id]||[];
-  if(locs.length) mapInstance.setView([locs[0].lat,locs[0].lng],18);
+    routeSpecies=topN.filter(s=>s.closestLat!==undefined);
+    prevDistances={};
+    if(hint) hint.textContent=`📍 ${routeSpecies.length} species found within 1 mi · move to update`;
+  } catch(e){
+    if(hint) hint.textContent='⚠ Scan failed — try Rescan from here';
+  }
+
+  updateRouteSlots(userLat||centerLat, userLng||centerLng, true);
 }
 
-function resetHighlight(){
-  selectedTaxonId=null;
-  highlightLayerGroup.clearLayers();
-  speciesLayerGroup.eachLayer(marker=>{
-    marker.setStyle({radius:7,color:'#854f0b',fillColor:'#EF9F27',fillOpacity:0.85,weight:1.5});
-  });
+// Slot1: absolute closest. Slot2: 2nd closest initially, then nearest "approaching" species after movement
+function updateRouteSlots(myLat, myLng, isInitial){
+  if(!routeSpecies.length){ routeSlot1=null; routeSlot2=null; renderRouteCards(); return; }
+  const withDist=routeSpecies.map(s=>({s,dist:distMeters(myLat,myLng,s.closestLat,s.closestLng)})).sort((a,b)=>a.dist-b.dist);
+  routeSlot1=withDist[0]?{...withDist[0].s, currentDist:withDist[0].dist}:null;
+  let slot2Pick=null;
+  if(isInitial){
+    slot2Pick=withDist[1]?{...withDist[1].s, currentDist:withDist[1].dist}:null;
+  } else {
+    for(const wd of withDist){
+      if(routeSlot1 && wd.s.taxon_id===routeSlot1.taxon_id) continue;
+      const prev=prevDistances[wd.s.taxon_id];
+      if(prev!==undefined && wd.dist < prev){
+        slot2Pick={...wd.s, currentDist:wd.dist};
+        break;
+      }
+    }
+    if(!slot2Pick) slot2Pick=withDist[1]?{...withDist[1].s, currentDist:withDist[1].dist}:null;
+  }
+  routeSlot2=slot2Pick;
+  withDist.forEach(wd=>{ prevDistances[wd.s.taxon_id]=wd.dist; });
+  renderRouteMarkers();
+  renderRouteCards();
 }
 
-async function pinSpecies(taxon_id,name,sci){
-  switchTab('map');
-  await new Promise(r=>setTimeout(r,200));
-  if(!mapInstance){ initMap(); await new Promise(r=>setTimeout(r,400)); }
-  // If already cached, just highlight
-  if(speciesLocCache[taxon_id]){
-    highlightSpecies(taxon_id,name,sci);
+function renderRouteMarkers(){
+  if(!routeMapInstance) return;
+  if(routeSlot1Marker){ routeMapInstance.removeLayer(routeSlot1Marker); routeSlot1Marker=null; }
+  if(routeSlot2Marker){ routeMapInstance.removeLayer(routeSlot2Marker); routeSlot2Marker=null; }
+
+  const mkIcon=(color, dist, label)=>L.divIcon({
+    className:'plant-marker',
+    html:`<div style="background:${color};width:20px;height:20px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.5)"></div><div style="color:${color};font-weight:700;font-size:10px;text-align:center;text-shadow:0 0 3px #fff,0 0 3px #fff;margin-top:1px">${label} · ${Math.round(dist)}m</div>`,
+    iconSize:[60,42], iconAnchor:[30,10]
+  });
+
+  if(routeSlot1){
+    routeSlot1Marker=L.marker([routeSlot1.closestLat,routeSlot1.closestLng],
+      {icon:mkIcon('#ff4444',routeSlot1.currentDist,'#1'),zIndexOffset:2100})
+      .addTo(routeMapInstance)
+      .bindPopup(`<b>${cap(routeSlot1.name)}</b><br><a href="https://www.inaturalist.org/observations/${routeSlot1.closestObsId}" target="_blank">View on iNat ↗</a>`);
+  }
+  if(routeSlot2 && routeSlot2.taxon_id !== (routeSlot1?routeSlot1.taxon_id:null)){
+    routeSlot2Marker=L.marker([routeSlot2.closestLat,routeSlot2.closestLng],
+      {icon:mkIcon('#1f6fc0',routeSlot2.currentDist,'#2'),zIndexOffset:2000})
+      .addTo(routeMapInstance)
+      .bindPopup(`<b>${cap(routeSlot2.name)}</b><br><a href="https://www.inaturalist.org/observations/${routeSlot2.closestObsId}" target="_blank">View on iNat ↗</a>`);
+  }
+
+  const myLat=userLat||searchLat, myLng=userLng||searchLng;
+  const bounds=[[myLat,myLng]];
+  if(routeSlot1) bounds.push([routeSlot1.closestLat,routeSlot1.closestLng]);
+  if(routeSlot2) bounds.push([routeSlot2.closestLat,routeSlot2.closestLng]);
+  if(bounds.length>1){
+    try { routeMapInstance.fitBounds(bounds,{padding:[60,60],maxZoom:18}); } catch(e){}
+  }
+}
+
+function renderRouteCards(){
+  const out=$('route-cards'); if(!out) return;
+  if(!routeSlot1 && !routeSlot2){
+    out.innerHTML='<div class="more-label" style="padding:12px 0">No species found in 1 mile · try rescanning</div>';
     return;
   }
-  // Otherwise fetch then highlight
-  try {
-    const locs=await fetchLocs(taxon_id);
-    speciesLocCache[taxon_id]=locs;
-    const sp=missingSpecies.find(s=>s.taxon_id===taxon_id);
-    if(sp&&locs.length){
-      sp.nearestDist=distMeters(userLat||searchLat,userLng||searchLng,locs[0].lat,locs[0].lng);
-      sortByProximity();
-    }
-    locs.forEach(loc=>{
-      const marker=L.circleMarker([loc.lat,loc.lng],{
-        radius:7,color:'#854f0b',fillColor:'#EF9F27',fillOpacity:0.85,weight:1.5
-      }).bindPopup(`<b>${cap(name)}</b><br><em>${sci}</em><br><a href="https://www.inaturalist.org/observations/${loc.id}" target="_blank">View on iNat ↗</a>`);
-      marker._taxonId=taxon_id;
-      marker.on('click',()=>highlightSpecies(taxon_id,name,sci));
-      speciesLayerGroup.addLayer(marker);
-    });
-    highlightSpecies(taxon_id,name,sci);
-  } catch(e){}
+  const card=(slot,color,label)=>{
+    if(!slot) return '';
+    const url=`https://www.inaturalist.org/observations/${slot.closestObsId}`;
+    const photoSrc=slot.photoLarge||slot.photo||'';
+    return `
+      <div style="background:#fff;border:1px solid #e0ded6;border-left:4px solid ${color};border-radius:10px;padding:10px;margin-bottom:10px;display:flex;gap:10px;align-items:center">
+        ${photoSrc
+          ? `<img src="${photoSrc}" alt="" loading="lazy"
+              style="width:70px;height:70px;border-radius:8px;object-fit:cover;cursor:pointer;flex-shrink:0"
+              onclick="window.open('${url}','_blank')"/>`
+          : `<div style="width:70px;height:70px;border-radius:8px;background:#f0efe8;display:flex;align-items:center;justify-content:center;font-size:30px;cursor:pointer;flex-shrink:0" onclick="window.open('${url}','_blank')">🌱</div>`}
+        <div style="flex:1;min-width:0">
+          <div style="font-size:11px;font-weight:700;color:${color};margin-bottom:2px">${label} · ${Math.round(slot.currentDist)}m</div>
+          <div style="font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${cap(slot.name)}</div>
+          <div style="font-size:12px;color:#6b6b65;font-style:italic;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${slot.sci}</div>
+          <div style="font-size:11px;color:#9b9b92;margin-top:2px">${slot.lastObsDate?'Last seen '+fmtDate(slot.lastObsDate):''}</div>
+        </div>
+      </div>`;
+  };
+  out.innerHTML=card(routeSlot1,'#ff4444','#1 CLOSEST') + card(routeSlot2,'#1f6fc0','#2 APPROACHING');
 }
 
-async function buildRoute(){
-  const out=$('route-out'); if(!out) return;
-  out.innerHTML=loader('Fetching exact locations…');
-  let pts=[];
-  for(let s of missingSpecies.slice(0,10)){
-    try {
-      const locs=await fetchLocs(s.taxon_id);
-      if(locs.length){
-        s.nearestDist=distMeters(userLat||searchLat,userLng||searchLng,locs[0].lat,locs[0].lng);
-        pts.push({lat:locs[0].lat,lng:locs[0].lng,name:s.name,sci:s.sci});
-      }
-    } catch(e){}
-  }
-  sortByProximity();
-  if(!pts.length){ out.innerHTML='<div class="more-label" style="padding:12px 0">No exact coordinates yet.</div>'; return; }
-  let route=[],rem=[...pts],cLat=userLat||searchLat,cLng=userLng||searchLng;
-  while(rem.length){
-    let bi=0,bd=Infinity;
-    rem.forEach((p,i)=>{ const dd=Math.hypot(p.lat-cLat,p.lng-cLng); if(dd<bd){bd=dd;bi=i;} });
-    route.push(rem[bi]); cLat=rem[bi].lat; cLng=rem[bi].lng; rem.splice(bi,1);
-  }
-  if(mapInstance){
-    L.polyline([[userLat||searchLat,userLng||searchLng],...route.map(p=>[p.lat,p.lng])],
-      {color:'#185FA5',weight:2.5,dashArray:'7 5',opacity:0.75}).addTo(mapInstance);
-    route.forEach((p,i)=>L.marker([p.lat,p.lng]).addTo(mapInstance).bindPopup(`<b>${i+1}. ${cap(p.name)}</b>`));
-    mapInstance.fitBounds([[userLat||searchLat,userLng||searchLng],...route.map(p=>[p.lat,p.lng])],{padding:[20,20]});
-  }
-  out.innerHTML=`
-    <div class="section-label" style="margin-top:4px"><span>Route · ${route.length} stops</span></div>
-    ${route.map((p,i)=>`
-      <div class="route-item">
-        <div class="route-num">${i+1}</div>
-        <div class="species-info"><div class="species-name">${cap(p.name)}</div><div class="species-sci">${p.sci}</div></div>
-      </div>`).join('')}
-    <div class="more-label">Route drawn on map above</div>
-  `;
+function startRouteGPS(){
+  if(routeWatchId!==null) navigator.geolocation.clearWatch(routeWatchId);
+  if(!navigator.geolocation) return;
+  routeWatchId=navigator.geolocation.watchPosition(pos=>{
+    userLat=pos.coords.latitude; userLng=pos.coords.longitude;
+    if(routeMapInstance && routeUserMarker){
+      routeUserMarker.setLatLng([userLat,userLng]);
+      if(routeHeadingMarker) updateHeadingMarker(routeHeadingMarker,[userLat,userLng],currentHeading||0);
+    }
+    updateRouteSlots(userLat,userLng,false);
+  },()=>{/* gps unavailable */},{enableHighAccuracy:true,maximumAge:3000,timeout:12000});
+}
+
+function stopRouteGPS(){
+  if(routeWatchId!==null){ navigator.geolocation.clearWatch(routeWatchId); routeWatchId=null; }
+}
+
+async function rescanRouteFromHere(){
+  const myLat=userLat||searchLat, myLng=userLng||searchLng;
+  await scanRouteArea(myLat,myLng);
+}
+
+function leaveRouteTab(){
+  stopRouteGPS();
+  stopCompass();
+}
+
+// pinSpecies — called from list "Map" button. Now opens detail view since map tab is reserved.
+function pinSpecies(taxon_id,name,sci){
+  const s=missingSpecies.find(x=>x.taxon_id===taxon_id);
+  openDetail(taxon_id,name,sci,s?(s.photoLarge||s.photo||''):'');
 }
 
 // ── Detail modal ──────────────────────────────────────────────────────────────
@@ -921,6 +1021,9 @@ async function openDetail(taxon_id,name,sci,photoUrl){
   const modal=$('detail-modal');
   const img=$('detail-img'); const ph=$('detail-placeholder');
   $('detail-name').textContent=cap(name); $('detail-sci').textContent=sci;
+  // Clear any previous photo click handler
+  img.onclick=null; ph.onclick=null;
+  img.style.cursor='default'; ph.style.cursor='default';
   if(photoUrl){ img.src=photoUrl; img.style.display='block'; ph.style.display='none'; }
   else { img.style.display='none'; ph.style.display='flex'; }
   modal.classList.add('open'); document.body.style.overflow='hidden';
@@ -945,27 +1048,22 @@ async function openDetail(taxon_id,name,sci,photoUrl){
   });
   detailUserMarker=L.marker([myLat,myLng],{icon:youIcon,zIndexOffset:3000}).addTo(detailMapInstance);
 
-  // Compass heading triangle
   detailHeadingMarker=createHeadingMarker([myLat,myLng],0);
   detailHeadingMarker.addTo(detailMapInstance);
 
-  // Start live GPS tracking
   startDetailGPS();
-
-  // Compass — on iOS needs user gesture, so we try silently first
   startCompass();
 
   // Fetch species locations — wider search to find them
   try {
     const searchRadius=Math.max(RADIUS_STEPS[radiusIdx],5);
-    const r=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${taxon_id}&lat=${myLat}&lng=${myLng}&radius=${searchRadius}&quality_grade=${QUALITY}&hrank=species&per_page=50&fields=id,location`);
+    const r=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${taxon_id}&lat=${myLat}&lng=${myLng}&radius=${searchRadius}&quality_grade=${QUALITY}&hrank=species&per_page=50&fields=id,location,observed_on&order=desc&order_by=observed_on`);
     const d=await r.json();
     const allLocs=(d.results||[]).filter(o=>o.location).map(o=>{
       const [lat,lng]=o.location.split(',').map(Number);
-      return {lat,lng,id:o.id,dist:distMeters(myLat,myLng,lat,lng)};
+      return {lat,lng,id:o.id,observed_on:o.observed_on,dist:distMeters(myLat,myLng,lat,lng)};
     }).sort((a,b)=>a.dist-b.dist);
 
-    // ONLY show the closest observation
     const closest=allLocs[0];
     if(closest){
       const dist=Math.round(closest.dist);
@@ -977,16 +1075,22 @@ async function openDetail(taxon_id,name,sci,photoUrl){
       });
       L.marker([closest.lat,closest.lng],{icon:plantIcon,zIndexOffset:2000})
         .addTo(detailMapInstance)
-        .bindPopup(`<b>${cap(name)}</b><br>${dist}m away<br><a href="https://www.inaturalist.org/observations/${closest.id}" target="_blank">View on iNat ↗</a>`);
+        .bindPopup(`<b>${cap(name)}</b><br>${dist}m away · <a href="https://www.inaturalist.org/observations/${closest.id}" target="_blank">View on iNat ↗</a>`);
 
-      // Update sort distance
+      // Cache details on the species record
       const sp=missingSpecies.find(s=>s.taxon_id===taxon_id);
-      if(sp&&sp.nearestDist===undefined){
-        sp.nearestDist=closest.dist;
+      if(sp){
+        if(sp.nearestDist===undefined) sp.nearestDist=closest.dist;
+        sp.closestObsId=closest.id;
+        if(closest.observed_on) sp.lastObsDate=closest.observed_on;
         sortByProximity();
       }
 
-      // Zoom to show YOU + closest with padding
+      // Make photo clickable → opens closest obs on iNat
+      const obsUrl=`https://www.inaturalist.org/observations/${closest.id}`;
+      img.style.cursor='pointer'; img.onclick=()=>window.open(obsUrl,'_blank');
+      ph.style.cursor='pointer';  ph.onclick=()=>window.open(obsUrl,'_blank');
+
       detailMapInstance.fitBounds([[myLat,myLng],[closest.lat,closest.lng]],{padding:[50,50],maxZoom:18});
     }
   } catch(e){}
@@ -1103,6 +1207,7 @@ function esc(s){ return (s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replac
 
 // Init
 loadSavedUsername();
+loadDatePrefs();
 </script>
 </body>
 </html>
