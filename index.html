@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- CNC Species Finder · Version 17 · 2026-06-26 -->
+<!-- CNC Species Finder · Version 18 · 2026-06-26 -->
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -40,6 +40,7 @@ input[type=text]:focus{border-color:#1D9E75;box-shadow:0 0 0 2px rgba(29,158,117
 .filter-btn{background:#f0efe8;color:#3d3d3a;border:none;border-radius:20px;padding:5px 12px;font-size:12px;font-weight:500;cursor:pointer}
 .filter-btn.active{background:#1D9E75;color:#fff}
 .species-item{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #f0efe8}
+.exclude-cb{width:20px;height:20px;flex-shrink:0;cursor:pointer;accent-color:#c33}
 .species-item:last-child{border-bottom:none}
 .species-photo{width:50px;height:50px;border-radius:8px;object-fit:cover;background:#f0efe8;flex-shrink:0;cursor:pointer}
 .species-placeholder{width:50px;height:50px;border-radius:8px;background:#f0efe8;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:22px;cursor:pointer}
@@ -166,6 +167,12 @@ let lastRefreshLat = null;
 let lastRefreshLng = null;
 let includeAnimals = false;   // toggle: include nearby animals seen in last week
 let myAllSpecies   = null;     // cache of user's observations across all taxa (for animal mode)
+// Session-only exclusion set: taxon_ids the user chose to hide
+let excludedTaxa   = new Set();
+// GPS smoothing: rolling buffer of recent readings
+const GPS_BUFFER_SIZE = 4;
+const SLOT_HYSTERESIS_M = 5;  // 5m required for a slot to swap species
+let gpsBuffer = [];
 
 const $ = id => document.getElementById(id);
 const main = () => $('main');
@@ -206,6 +213,17 @@ function distMeters(lat1,lng1,lat2,lng2){
   const a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)**2;
   return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
 }
+
+// Push a raw GPS reading into the smoothing buffer and return the averaged {lat,lng}.
+// Averaging the last 4 readings damps out GPS jitter that causes slots to flicker.
+function pushGpsAndSmooth(lat,lng){
+  gpsBuffer.push({lat,lng});
+  if(gpsBuffer.length>GPS_BUFFER_SIZE) gpsBuffer.shift();
+  let sumLat=0,sumLng=0;
+  for(const p of gpsBuffer){ sumLat+=p.lat; sumLng+=p.lng; }
+  return {lat:sumLat/gpsBuffer.length, lng:sumLng/gpsBuffer.length};
+}
+function resetGpsBuffer(){ gpsBuffer=[]; }
 
 // ── CNC detection ─────────────────────────────────────────────────────────────
 async function detectCNC(){
@@ -733,7 +751,7 @@ function renderTab(){
 }
 
 function renderList(el){
-  let filtered=missingSpecies;
+  let filtered=missingSpecies.filter(s=>!excludedTaxa.has(s.taxon_id));
   if(activeFilter==='fungi')       filtered=filtered.filter(s=>(s.iconic||'').toLowerCase()==='fungi');
   else if(activeFilter==='cactus') filtered=filtered.filter(s=>isCactusYucca(s.sci));
   else if(activeFilter==='tree')   filtered=filtered.filter(s=>s.isTree||isLikelyTree(s.sci,s.name));
@@ -752,6 +770,7 @@ function renderList(el){
     <div class="section-label"><span>${filtered.length} to find</span><span>${sortedByProx?'nearest first':'most observed first'}</span></div>
     ${filtered.slice(0,50).map((s,idx)=>`
       <div class="species-item">
+        <input type="checkbox" class="exclude-cb" title="Hide this species" onclick="excludeSpecies(${s.taxon_id})"/>
         ${s.photo
           ?`<img class="species-photo" src="${s.photo}" loading="lazy" onerror="this.style.display='none'" alt=""
               data-idx="${missingSpecies.indexOf(s)}" onclick="openDetailByIdx(this.dataset.idx)"/>`
@@ -764,27 +783,46 @@ function renderList(el){
         <button class="map-btn" onclick="pinSpecies(${s.taxon_id},'${esc(s.name)}','${esc(s.sci)}')">Map</button>
       </div>`).join('')}
     ${filtered.length>50?`<div class="more-label">+ ${filtered.length-50} more</div>`:''}
+    ${excludedTaxa.size>0?`<div style="text-align:center;margin-top:12px"><button class="btn-secondary" onclick="clearExclusions()" style="font-size:12px">Restore ${excludedTaxa.size} hidden species</button></div>`:''}
     <div style="height:8px"></div>
   `;
+}
+
+// Session-only exclusion: hide a species from lists and map slots
+function excludeSpecies(taxon_id){
+  excludedTaxa.add(taxon_id);
+  // Refresh list
+  if(activeTab==='list'){ const el=$('tab-content'); if(el) renderList(el); }
+  // Update Map & Route slots
+  const myLat=userLat||searchLat, myLng=userLng||searchLng;
+  if(typeof updateRouteSlots==='function') updateRouteSlots(myLat,myLng,false);
+}
+
+function clearExclusions(){
+  excludedTaxa.clear();
+  if(activeTab==='list'){ const el=$('tab-content'); if(el) renderList(el); }
+  const myLat=userLat||searchLat, myLng=userLng||searchLng;
+  if(typeof updateRouteSlots==='function') updateRouteSlots(myLat,myLng,false);
 }
 
 // ── Map tab ───────────────────────────────────────────────────────────────────
 // ────────── MAP & ROUTE (1-mile scan, 2 species view) ──────────
 const MAP_ROUTE_RADIUS_KM = 1.609;  // 1 mile
 
-let routeSpecies = [];         // species with cached closest coord + last date
-let routeSlot1 = null;         // closest
-let routeSlot2 = null;         // closest one user is approaching
-let prevDistances = {};        // taxon_id → distance at previous GPS update
+let routeSpecies = [];         // species with allLocs: [{lat,lng,id,observed_on}, ...]
+let routeSlots = [null,null,null,null];  // slot index → currently-shown species (with currentDist + activeObsId etc.)
+let prevDistances = {};        // taxon_id → smoothed distance at previous GPS update
 let routeWatchId = null;
 let routeMapInstance = null;
 let routeUserMarker = null;
 let routeHeadingMarker = null;
-let routeSlot1Marker = null;
-let routeSlot2Marker = null;
+let routeSlotMarkers = [null,null,null,null];  // Leaflet markers for each slot
 
 // Cache used by detail-view pinSpecies fallback
 let speciesLocCache = {};
+
+const SLOT_COLORS = ['#ff4444','#1f6fc0','#7a3fa0','#c07a1f'];
+const SLOT_LABELS = ['#1 CLOSEST','#2 APPROACHING','#3 APPROACHING','#4 APPROACHING'];
 
 function renderMapTab(el){
   el.innerHTML=`
@@ -821,6 +859,7 @@ async function initRouteMap(){
   routeHeadingMarker=createHeadingMarker([myLat,myLng],0);
   routeHeadingMarker.addTo(routeMapInstance);
 
+  resetGpsBuffer();
   startRouteGPS();
   startCompass();
 
@@ -830,6 +869,8 @@ async function initRouteMap(){
 async function scanRouteArea(centerLat, centerLng){
   const hint=$('route-hint');
   if(hint) hint.textContent='⏳ Scanning 1 mile radius…';
+  routeSlots=[null,null,null,null];
+  prevDistances={};
 
   try {
     const dates=myDateParams();
@@ -845,38 +886,30 @@ async function scanRouteArea(centerLat, centerLng){
       photoLarge:s.taxon.default_photo?.medium_url||s.taxon.default_photo?.square_url||null,
       iconic:s.taxon.iconic_taxon_name||'',
       lastObsDate:undefined,
-      closestLat:undefined,
-      closestLng:undefined,
-      closestObsId:undefined
+      allLocs:[]   // ALL observation coords, not just closest
     })).filter(s=>!mySpecies.has(s.taxon_id));
 
     const noPhoto=candidates.filter(s=>!s.photo);
     if(noPhoto.length) await enrichWithPhotos(noPhoto);
 
     candidates.sort((a,b)=>b.count-a.count);
-    const topN=candidates.slice(0,25);
+    const topN=candidates.slice(0,30);
     for(const s of topN){
       try {
-        const r2=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${s.taxon_id}&lat=${centerLat}&lng=${centerLng}&radius=${MAP_ROUTE_RADIUS_KM}&quality_grade=${QUALITY}&hrank=species&per_page=30&fields=id,location,observed_on&order=desc&order_by=observed_on`);
+        const r2=await fetch(`https://api.inaturalist.org/v1/observations?taxon_id=${s.taxon_id}&lat=${centerLat}&lng=${centerLng}&radius=${MAP_ROUTE_RADIUS_KM}&quality_grade=${QUALITY}&hrank=species&per_page=100&fields=id,location,observed_on&order=desc&order_by=observed_on`);
         const d2j=await r2.json();
-        const locs=(d2j.results||[]).filter(o=>o.location).map(o=>{
+        // Save ALL observations for this species
+        s.allLocs=(d2j.results||[]).filter(o=>o.location).map(o=>{
           const [lat,lng]=o.location.split(',').map(Number);
-          return {lat,lng,id:o.id,observed_on:o.observed_on,
-                  dist:distMeters(centerLat,centerLng,lat,lng)};
-        }).sort((a,b)=>a.dist-b.dist);
-        if(locs.length){
-          s.closestLat=locs[0].lat;
-          s.closestLng=locs[0].lng;
-          s.closestObsId=locs[0].id;
-          const dated=(d2j.results||[]).filter(o=>o.observed_on);
-          if(dated.length) s.lastObsDate=dated[0].observed_on;
-        }
+          return {lat,lng,id:o.id,observed_on:o.observed_on};
+        });
+        const dated=(d2j.results||[]).filter(o=>o.observed_on);
+        if(dated.length) s.lastObsDate=dated[0].observed_on;
       } catch(e){}
       await new Promise(r=>setTimeout(r,80));
     }
 
-    routeSpecies=topN.filter(s=>s.closestLat!==undefined);
-    prevDistances={};
+    routeSpecies=topN.filter(s=>s.allLocs.length>0);
     if(hint) hint.textContent=`📍 ${routeSpecies.length} species found within 1 mi · move to update`;
   } catch(e){
     if(hint) hint.textContent='⚠ Scan failed — try Rescan from here';
@@ -885,59 +918,150 @@ async function scanRouteArea(centerLat, centerLng){
   updateRouteSlots(userLat||centerLat, userLng||centerLng, true);
 }
 
-// Slot1: absolute closest. Slot2: 2nd closest initially, then nearest "approaching" species after movement
-function updateRouteSlots(myLat, myLng, isInitial){
-  if(!routeSpecies.length){ routeSlot1=null; routeSlot2=null; renderRouteCards(); return; }
-  const withDist=routeSpecies.map(s=>({s,dist:distMeters(myLat,myLng,s.closestLat,s.closestLng)})).sort((a,b)=>a.dist-b.dist);
-  routeSlot1=withDist[0]?{...withDist[0].s, currentDist:withDist[0].dist}:null;
-  let slot2Pick=null;
-  if(isInitial){
-    slot2Pick=withDist[1]?{...withDist[1].s, currentDist:withDist[1].dist}:null;
-  } else {
-    for(const wd of withDist){
-      if(routeSlot1 && wd.s.taxon_id===routeSlot1.taxon_id) continue;
-      const prev=prevDistances[wd.s.taxon_id];
-      if(prev!==undefined && wd.dist < prev){
-        slot2Pick={...wd.s, currentDist:wd.dist};
-        break;
+// For a species with allLocs, find the observation currently nearest to (myLat,myLng)
+// Returns {dist, loc:{lat,lng,id,observed_on}}
+function nearestObsFor(species, myLat, myLng){
+  let bestLoc=species.allLocs[0], bestDist=Infinity;
+  for(const loc of species.allLocs){
+    const d=distMeters(myLat,myLng,loc.lat,loc.lng);
+    if(d<bestDist){ bestDist=d; bestLoc=loc; }
+  }
+  return {dist:bestDist, loc:bestLoc};
+}
+
+// Recompute slots 1-4:
+//   Slot 1: absolute closest species (not excluded)
+//   Slot 2/3/4: next 3 closest species we're approaching (distance decreasing since last update)
+//               falling back to next closest overall if we don't have movement data yet.
+// Uses 5m hysteresis: an incumbent stays in its slot unless a challenger is 5m+ closer.
+function updateRouteSlots(rawLat, rawLng, isInitial){
+  if(!routeSpecies.length){
+    routeSlots=[null,null,null,null];
+    renderRouteMarkers();
+    renderRouteCards();
+    return;
+  }
+
+  // Smooth the GPS reading against last N raw points
+  const smooth = pushGpsAndSmooth(rawLat,rawLng);
+  const myLat = smooth.lat, myLng = smooth.lng;
+
+  // For each active species, compute current-nearest observation and its distance
+  const scored=routeSpecies
+    .filter(s=>!excludedTaxa.has(s.taxon_id))
+    .map(s=>{
+      const near=nearestObsFor(s, myLat, myLng);
+      return {s, dist:near.dist, loc:near.loc};
+    })
+    .sort((a,b)=>a.dist-b.dist);
+
+  // Helper: does the challenger beat the incumbent by ≥ hysteresis?
+  const beats=(challengerDist, incumbentTaxonId)=>{
+    if(!incumbentTaxonId) return true;
+    const incumbent=scored.find(x=>x.s.taxon_id===incumbentTaxonId);
+    if(!incumbent) return true;   // incumbent no longer available (excluded etc.)
+    return (incumbent.dist - challengerDist) >= SLOT_HYSTERESIS_M;
+  };
+
+  const newSlots=[null,null,null,null];
+
+  // Slot 1: absolute closest, with hysteresis vs current slot 1
+  if(scored.length){
+    const closest=scored[0];
+    const currentSlot1Id = routeSlots[0]?routeSlots[0].taxon_id:null;
+    if(!currentSlot1Id || currentSlot1Id===closest.s.taxon_id || beats(closest.dist, currentSlot1Id)){
+      newSlots[0]={...closest.s, currentDist:closest.dist, activeObsId:closest.loc.id,
+                   activeLat:closest.loc.lat, activeLng:closest.loc.lng};
+    } else {
+      // Keep incumbent — re-compute its live distance
+      const incumbent=scored.find(x=>x.s.taxon_id===currentSlot1Id);
+      if(incumbent){
+        newSlots[0]={...incumbent.s, currentDist:incumbent.dist, activeObsId:incumbent.loc.id,
+                     activeLat:incumbent.loc.lat, activeLng:incumbent.loc.lng};
+      } else {
+        newSlots[0]={...closest.s, currentDist:closest.dist, activeObsId:closest.loc.id,
+                     activeLat:closest.loc.lat, activeLng:closest.loc.lng};
       }
     }
-    if(!slot2Pick) slot2Pick=withDist[1]?{...withDist[1].s, currentDist:withDist[1].dist}:null;
   }
-  routeSlot2=slot2Pick;
-  withDist.forEach(wd=>{ prevDistances[wd.s.taxon_id]=wd.dist; });
+
+  // Slots 2-4: next 3 species approaching (or next closest on initial scan / no movement data)
+  const usedIds=new Set(newSlots.filter(x=>x).map(x=>x.taxon_id));
+
+  // Build a list of candidates ordered by preference:
+  //   - if we have prevDistances (not initial): species with decreasing distance, sorted by current distance
+  //   - then fall back to closest-first for any remaining slots
+  let approachers=[];
+  if(!isInitial){
+    approachers=scored.filter(x=>{
+      if(usedIds.has(x.s.taxon_id)) return false;
+      const prev=prevDistances[x.s.taxon_id];
+      return prev!==undefined && x.dist < prev;
+    });
+  }
+  // Remaining (non-approaching) fallback in sorted-by-distance order
+  const fallback=scored.filter(x=>!usedIds.has(x.s.taxon_id) && !approachers.some(a=>a.s.taxon_id===x.s.taxon_id));
+  const orderedCandidates=[...approachers, ...fallback];
+
+  // Fill slots 1..3 (indices in newSlots 1..3) with hysteresis vs current occupants
+  for(let slot=1; slot<=3 && orderedCandidates.length; slot++){
+    const currentId = routeSlots[slot]?routeSlots[slot].taxon_id:null;
+    // Try incumbent first if still available and not used
+    if(currentId && !usedIds.has(currentId)){
+      const incumbent=scored.find(x=>x.s.taxon_id===currentId);
+      // Would any challenger from orderedCandidates beat the incumbent by hysteresis?
+      const challenger=orderedCandidates.find(c=>!usedIds.has(c.s.taxon_id));
+      if(incumbent && challenger && (incumbent.dist - challenger.dist) < SLOT_HYSTERESIS_M){
+        // Keep incumbent — challenger not close enough to warrant swap
+        newSlots[slot]={...incumbent.s, currentDist:incumbent.dist, activeObsId:incumbent.loc.id,
+                       activeLat:incumbent.loc.lat, activeLng:incumbent.loc.lng};
+        usedIds.add(currentId);
+        continue;
+      }
+      // otherwise fall through to pick the challenger
+    }
+    // Pick first unused candidate
+    const pick=orderedCandidates.find(c=>!usedIds.has(c.s.taxon_id));
+    if(pick){
+      newSlots[slot]={...pick.s, currentDist:pick.dist, activeObsId:pick.loc.id,
+                     activeLat:pick.loc.lat, activeLng:pick.loc.lng};
+      usedIds.add(pick.s.taxon_id);
+    }
+  }
+
+  routeSlots=newSlots;
+  // Record current smoothed distances for next update
+  scored.forEach(x=>{ prevDistances[x.s.taxon_id]=x.dist; });
+
   renderRouteMarkers();
   renderRouteCards();
 }
 
 function renderRouteMarkers(){
   if(!routeMapInstance) return;
-  if(routeSlot1Marker){ routeMapInstance.removeLayer(routeSlot1Marker); routeSlot1Marker=null; }
-  if(routeSlot2Marker){ routeMapInstance.removeLayer(routeSlot2Marker); routeSlot2Marker=null; }
+  for(let i=0;i<4;i++){
+    if(routeSlotMarkers[i]){ routeMapInstance.removeLayer(routeSlotMarkers[i]); routeSlotMarkers[i]=null; }
+  }
 
   const mkIcon=(color, dist, label)=>L.divIcon({
     className:'plant-marker',
     html:`<div style="background:${color};width:20px;height:20px;border-radius:50%;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,0.5)"></div><div style="color:${color};font-weight:700;font-size:10px;text-align:center;text-shadow:0 0 3px #fff,0 0 3px #fff;margin-top:1px">${label} · ${Math.round(dist)}m</div>`,
-    iconSize:[60,42], iconAnchor:[30,10]
+    iconSize:[70,42], iconAnchor:[35,10]
   });
 
-  if(routeSlot1){
-    routeSlot1Marker=L.marker([routeSlot1.closestLat,routeSlot1.closestLng],
-      {icon:mkIcon('#ff4444',routeSlot1.currentDist,'#1'),zIndexOffset:2100})
+  const shortLabels=['#1','#2','#3','#4'];
+  for(let i=0;i<4;i++){
+    const slot=routeSlots[i]; if(!slot) continue;
+    routeSlotMarkers[i]=L.marker([slot.activeLat,slot.activeLng],
+      {icon:mkIcon(SLOT_COLORS[i],slot.currentDist,shortLabels[i]),zIndexOffset:2100-i*10})
       .addTo(routeMapInstance)
-      .bindPopup(`<b>${cap(routeSlot1.name)}</b><br><a href="https://www.inaturalist.org/observations/${routeSlot1.closestObsId}" target="_blank">View on iNat ↗</a>`);
-  }
-  if(routeSlot2 && routeSlot2.taxon_id !== (routeSlot1?routeSlot1.taxon_id:null)){
-    routeSlot2Marker=L.marker([routeSlot2.closestLat,routeSlot2.closestLng],
-      {icon:mkIcon('#1f6fc0',routeSlot2.currentDist,'#2'),zIndexOffset:2000})
-      .addTo(routeMapInstance)
-      .bindPopup(`<b>${cap(routeSlot2.name)}</b><br><a href="https://www.inaturalist.org/observations/${routeSlot2.closestObsId}" target="_blank">View on iNat ↗</a>`);
+      .bindPopup(`<b>${cap(slot.name)}</b><br><a href="https://www.inaturalist.org/observations/${slot.activeObsId}" target="_blank">View on iNat ↗</a>`);
   }
 
+  // Fit bounds: YOU + all active slots
   const myLat=userLat||searchLat, myLng=userLng||searchLng;
   const bounds=[[myLat,myLng]];
-  if(routeSlot1) bounds.push([routeSlot1.closestLat,routeSlot1.closestLng]);
-  if(routeSlot2) bounds.push([routeSlot2.closestLat,routeSlot2.closestLng]);
+  routeSlots.forEach(s=>{ if(s) bounds.push([s.activeLat,s.activeLng]); });
   if(bounds.length>1){
     try { routeMapInstance.fitBounds(bounds,{padding:[60,60],maxZoom:18}); } catch(e){}
   }
@@ -945,16 +1069,20 @@ function renderRouteMarkers(){
 
 function renderRouteCards(){
   const out=$('route-cards'); if(!out) return;
-  if(!routeSlot1 && !routeSlot2){
+  const activeSlots=routeSlots.filter(x=>x);
+  if(!activeSlots.length){
     out.innerHTML='<div class="more-label" style="padding:12px 0">No species found in 1 mile · try rescanning</div>';
     return;
   }
-  const card=(slot,color,label)=>{
+  const card=(slot,slotIndex)=>{
     if(!slot) return '';
-    const url=`https://www.inaturalist.org/observations/${slot.closestObsId}`;
+    const color=SLOT_COLORS[slotIndex];
+    const label=SLOT_LABELS[slotIndex];
+    const url=`https://www.inaturalist.org/observations/${slot.activeObsId}`;
     const photoSrc=slot.photoLarge||slot.photo||'';
     return `
       <div style="background:#fff;border:1px solid #e0ded6;border-left:4px solid ${color};border-radius:10px;padding:10px;margin-bottom:10px;display:flex;gap:10px;align-items:center">
+        <input type="checkbox" class="exclude-cb" title="Hide this species" onclick="excludeSpecies(${slot.taxon_id})"/>
         ${photoSrc
           ? `<img src="${photoSrc}" alt="" loading="lazy"
               style="width:70px;height:70px;border-radius:8px;object-fit:cover;cursor:pointer;flex-shrink:0"
@@ -968,7 +1096,14 @@ function renderRouteCards(){
         </div>
       </div>`;
   };
-  out.innerHTML=card(routeSlot1,'#ff4444','#1 CLOSEST') + card(routeSlot2,'#1f6fc0','#2 APPROACHING');
+  let html='';
+  for(let i=0;i<4;i++){
+    if(routeSlots[i]) html+=card(routeSlots[i],i);
+  }
+  if(excludedTaxa.size>0){
+    html+=`<div style="text-align:center;margin-top:6px"><button class="btn-secondary" onclick="clearExclusions()" style="font-size:12px">Restore ${excludedTaxa.size} hidden species</button></div>`;
+  }
+  out.innerHTML=html;
 }
 
 function startRouteGPS(){
@@ -990,6 +1125,7 @@ function stopRouteGPS(){
 
 async function rescanRouteFromHere(){
   const myLat=userLat||searchLat, myLng=userLng||searchLng;
+  resetGpsBuffer();
   await scanRouteArea(myLat,myLng);
 }
 
